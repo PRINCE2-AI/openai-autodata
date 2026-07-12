@@ -1,0 +1,7 @@
+Title: Constraint-Aware Retrieval for Reliable Technical Assistants
+
+We study a retrieval system for technical support assistants operating over product manuals that change every week. A baseline retriever selects passages using semantic similarity alone. It performs well on common questions but often returns obsolete instructions when two manual versions describe the same component. We introduce a constraint-aware reranker that combines semantic relevance with document version, product family, and dependency compatibility.
+
+In a controlled evaluation, the reranker reduces obsolete citations but occasionally suppresses useful cross-version troubleshooting evidence. The largest gains appear when version metadata is complete. When metadata is missing or contradictory, the system can become overconfident in a smaller evidence set. A verifier that checks answer claims against the selected passages recovers some failures, although it increases latency.
+
+The results suggest that retrieval constraints and answer verification should be tuned jointly. Strict constraints improve precision under clean metadata, while softer constraints and explicit uncertainty handling are safer under distribution shift. Future work should test adaptive constraint strength based on metadata quality and the cost of an incorrect action.

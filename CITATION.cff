@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the repository and the Autodata paper that inspired it."
+title: "OpenAI Autodata"
+type: software
+authors:
+  - alias: "PRINCE2-AI"
+repository-code: "https://github.com/PRINCE2-AI/openai-autodata"
+url: "https://github.com/PRINCE2-AI/openai-autodata"
+license: MIT
+version: 0.1.0
+date-released: 2026-07-12
+references:
+  - type: article
+    title: "Autodata: An agentic data scientist to create high quality synthetic data"
+    url: "https://arxiv.org/abs/2606.25996"
+    year: 2026

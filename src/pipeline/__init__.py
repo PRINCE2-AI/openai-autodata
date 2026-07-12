@@ -1,0 +1,1 @@
+"""Agentic data-generation pipeline."""
