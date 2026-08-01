@@ -1,6 +1,6 @@
-openai>=2.45.0,<3.0.0
+openai>=2.50.0,<3.0.0
 python-dotenv>=1.2.2
-tqdm>=4.68.4
+tqdm>=4.70.0
 arxiv>=4.0.0
 pymupdf>=1.28.0
 tenacity>=9.1.4
