@@ -69,7 +69,7 @@ class OpenAIAgent:
         messages.append({"role": "user", "content": user_prompt})
 
         estimated_input_tokens = self._estimate_input_tokens(messages)
-        self.cost_tracker.ensure_can_call(
+        reservation = self.cost_tracker.reserve(
             self.model_name,
             estimated_input_tokens=estimated_input_tokens,
             max_output_tokens=self.max_tokens,
@@ -88,9 +88,17 @@ class OpenAIAgent:
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
 
-        response = self.client.chat.completions.create(**kwargs)
-        record = self.cost_tracker.record_response(
-            model=self.model_name,
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if _is_retryable_openai_error(exc):
+                # A timed-out attempt can still be billed, so settle its estimate before retrying.
+                self.cost_tracker.settle_failed_attempt(reservation, reason=type(exc).__name__)
+            else:
+                self.cost_tracker.release(reservation)
+            raise
+        record = self.cost_tracker.settle(
+            reservation,
             usage=getattr(response, "usage", None),
             role=self.__class__.__name__,
             fallback_tokens={
