@@ -6,6 +6,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx2
+from openai import APIConnectionError
+from tenacity import wait_none
+
 from src.agents.openai_agent import OpenAIAgent
 from src.pipeline.agentic_loop import (
     AgenticSelfInstruct,
@@ -89,6 +93,60 @@ class CostTrackerTests(unittest.TestCase):
             self.assertAlmostEqual(resumed.spent_usd, first.spent_usd)
             self.assertEqual(resumed.session_spent_usd, 0)
 
+    def test_corrupt_ledger_line_refuses_resume(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_path = Path(temp_dir) / "cost.jsonl"
+            report_path.write_text(
+                json.dumps({"model": "gpt-5.6-luna", "cost_usd": 0.01}) + "\n{not json}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                CostTracker(
+                    budget_usd=10,
+                    safety_margin_usd=1,
+                    report_path=str(report_path),
+                    resume=True,
+                )
+            self.assertIn("line 2", str(ctx.exception))
+            self.assertIn("Corrupt cost report", str(ctx.exception))
+
+    def test_negative_ledger_cost_refuses_resume(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_path = Path(temp_dir) / "cost.jsonl"
+            report_path.write_text(
+                json.dumps({"model": "gpt-5.6-luna", "cost_usd": -0.5}) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                CostTracker(
+                    budget_usd=10,
+                    safety_margin_usd=1,
+                    report_path=str(report_path),
+                    resume=True,
+                )
+
+    def test_reservation_blocks_and_settles_failed_attempt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = CostTracker(
+                budget_usd=1,
+                safety_margin_usd=0.1,
+                report_path=str(Path(temp_dir) / "cost.jsonl"),
+                resume=False,
+                input_safety_multiplier=1.0,
+            )
+            tracker.spent_usd = 0.85
+            reservation = tracker.reserve("gpt-5.6-sol", max_output_tokens=1000)
+            self.assertAlmostEqual(tracker.reserved_usd, 0.03)
+            with self.assertRaises(BudgetExceededError):
+                tracker.reserve("gpt-5.6-sol", max_output_tokens=1000)
+            self.assertAlmostEqual(tracker.reserved_usd, 0.03)
+
+            record = tracker.settle_failed_attempt(reservation, reason="APIConnectionError")
+            self.assertEqual(tracker.reserved_usd, 0.0)
+            self.assertTrue(record["usage_estimated"])
+            self.assertEqual(record["estimated_reason"], "APIConnectionError")
+            self.assertAlmostEqual(tracker.spent_usd, 0.88)
+
 
 class OpenAIAgentTests(unittest.TestCase):
     def test_json_mode_and_usage_tracking(self):
@@ -152,6 +210,85 @@ class OpenAIAgentTests(unittest.TestCase):
                 with self.assertRaises(BudgetExceededError):
                     agent.generate("", "hello")
             client.chat.completions.create.assert_not_called()
+
+    def test_retry_attempt_is_charged_before_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = configure_cost_tracker(
+                budget_usd=10,
+                safety_margin_usd=1,
+                report_path=str(Path(temp_dir) / "cost.jsonl"),
+                resume=False,
+            )
+            response = SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok": true}'))],
+                usage=SimpleNamespace(
+                    prompt_tokens=20,
+                    completion_tokens=5,
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+                ),
+            )
+            timeout = APIConnectionError(
+                request=httpx2.Request("POST", "https://api.openai.com/v1/chat/completions")
+            )
+            client = MagicMock()
+            client.chat.completions.create.side_effect = [timeout, response]
+
+            with patch.dict(
+                os.environ,
+                {"OPENAI_API_KEY": "sk-test", "OPENAI_TIMEOUT_SECONDS": "1"},
+                clear=False,
+            ), patch("src.agents.openai_agent.OpenAI", return_value=client):
+                agent = OpenAIAgent(
+                    model_name="gpt-5.6-luna",
+                    temperature=None,
+                    max_tokens=100,
+                    min_delay=0,
+                )
+                original_wait = agent.generate.retry.wait
+                agent.generate.retry.wait = wait_none()
+                try:
+                    result = agent.generate_json("system", "user")
+                finally:
+                    agent.generate.retry.wait = original_wait
+
+            self.assertEqual(result, {"ok": True})
+            records = [
+                json.loads(line)
+                for line in Path(temp_dir, "cost.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(records), 2)
+            self.assertTrue(records[0]["usage_estimated"])
+            self.assertEqual(records[0]["estimated_reason"], "APIConnectionError")
+            self.assertEqual(records[0]["role"], "retry")
+            self.assertFalse(records[1]["usage_estimated"])
+            self.assertAlmostEqual(tracker.spent_usd, sum(r["cost_usd"] for r in records), places=7)
+            self.assertEqual(tracker.reserved_usd, 0.0)
+            self.assertEqual(tracker.call_count, 2)
+
+    def test_non_retryable_error_releases_reservation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = configure_cost_tracker(
+                budget_usd=10,
+                safety_margin_usd=1,
+                report_path=str(Path(temp_dir) / "cost.jsonl"),
+                resume=False,
+            )
+            client = MagicMock()
+            client.chat.completions.create.side_effect = ValueError("bad request")
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=False), patch(
+                "src.agents.openai_agent.OpenAI", return_value=client
+            ):
+                agent = OpenAIAgent(
+                    model_name="gpt-5.6-luna",
+                    temperature=None,
+                    max_tokens=100,
+                    min_delay=0,
+                )
+                with self.assertRaises(ValueError):
+                    agent.generate("", "hello")
+            self.assertEqual(tracker.reserved_usd, 0.0)
+            self.assertEqual(tracker.spent_usd, 0.0)
+            self.assertFalse(Path(temp_dir, "cost.jsonl").exists())
 
 
 class PipelineTests(unittest.TestCase):

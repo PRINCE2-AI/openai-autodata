@@ -22,7 +22,7 @@ Many synthetic-data scripts generate examples once and keep them. This project t
 - **Persistent cost control:** a local ledger resumes across restarts and preflights each request against a configurable budget.
 - **Auditable output:** every round, answer, score, rejection reason, and cost estimate is saved.
 - **Role-specific models:** challenger, weak solver, strong solver, and judge models can be configured independently.
-- **Offline coverage:** 13 regression tests exercise budget, validation, scoring, persistence, and end-to-end control flow without API spend.
+- **Offline coverage:** 18 regression tests exercise budget, validation, scoring, persistence, and end-to-end control flow without API spend.
 
 ## Architecture
 
@@ -170,7 +170,9 @@ It covers:
 - cached and uncached token pricing
 - projected-call budget blocking
 - cost-ledger resume across restarts
+- corrupt-ledger refusal and reservation accounting
 - JSON mode and token-usage tracking
+- retry-attempt cost settlement
 - non-retryable budget failures
 - QA and rubric validation
 - weak/strong rollout failure handling

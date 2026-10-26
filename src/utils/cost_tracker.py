@@ -1,6 +1,7 @@
 import json
 import math
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -9,6 +10,17 @@ from uuid import uuid4
 
 class BudgetExceededError(RuntimeError):
     pass
+
+
+@dataclass
+class BudgetReservation:
+    """A preflight hold that is released or settled after the API call."""
+
+    model: str
+    estimated_input_tokens: int
+    max_output_tokens: int
+    estimated_cost_usd: float
+    active: bool = True
 
 
 MODEL_PRICING_USD_PER_1M = {
@@ -59,9 +71,9 @@ class CostTracker:
         self.report_path = Path(report_path or os.getenv("OPENAI_COST_REPORT_PATH", "data/cost_report.jsonl"))
         self.session_id = uuid4().hex
         self.spent_usd = 0.0
+        self.reserved_usd = 0.0
         self.call_count = 0
         self.by_model: Dict[str, Dict[str, float]] = {}
-        self.load_warnings = 0
 
         self._validate_settings()
         if resume:
@@ -79,7 +91,7 @@ class CostTracker:
 
     @property
     def guard_remaining_usd(self) -> float:
-        return max(0.0, self.guard_limit_usd - self.spent_usd)
+        return max(0.0, self.guard_limit_usd - self.spent_usd - self.reserved_usd)
 
     @property
     def session_spent_usd(self) -> float:
@@ -102,14 +114,75 @@ class CostTracker:
                 "completion_tokens": max_output_tokens,
             },
         )
-        projected_spend = self.spent_usd + estimated_next_cost
-        if self.spent_usd >= self.guard_limit_usd or projected_spend > self.guard_limit_usd:
+        projected_spend = self.spent_usd + self.reserved_usd + estimated_next_cost
+        if (
+            self.spent_usd + self.reserved_usd >= self.guard_limit_usd
+            or projected_spend > self.guard_limit_usd
+        ):
             raise BudgetExceededError(
                 f"Budget guard stopped before calling {model}. "
-                f"Estimated spent=${self.spent_usd:.4f}, next call up to=${estimated_next_cost:.4f}, "
+                f"Estimated spent=${self.spent_usd:.4f}, reserved=${self.reserved_usd:.4f}, "
+                f"next call up to=${estimated_next_cost:.4f}, "
                 f"guard limit=${self.guard_limit_usd:.2f}, total budget=${self.budget_usd:.2f}."
             )
         return estimated_next_cost
+
+    def reserve(
+        self,
+        model: str,
+        estimated_input_tokens: int = 0,
+        max_output_tokens: int = 0,
+    ) -> BudgetReservation:
+        estimated_cost = self.ensure_can_call(
+            model,
+            estimated_input_tokens=estimated_input_tokens,
+            max_output_tokens=max_output_tokens,
+        )
+        reservation = BudgetReservation(
+            model=model,
+            estimated_input_tokens=estimated_input_tokens,
+            max_output_tokens=max_output_tokens,
+            estimated_cost_usd=estimated_cost,
+        )
+        self.reserved_usd += estimated_cost
+        return reservation
+
+    def release(self, reservation: BudgetReservation) -> None:
+        if reservation.active:
+            self.reserved_usd = max(0.0, self.reserved_usd - reservation.estimated_cost_usd)
+            reservation.active = False
+
+    def settle(
+        self,
+        reservation: BudgetReservation,
+        usage: Any,
+        role: str = "",
+        fallback_tokens: Optional[Dict[str, int]] = None,
+    ) -> Dict[str, Any]:
+        self.release(reservation)
+        return self.record_response(
+            model=reservation.model,
+            usage=usage,
+            role=role,
+            fallback_tokens=fallback_tokens,
+        )
+
+    def settle_failed_attempt(
+        self, reservation: BudgetReservation, reason: str = "retryable_error"
+    ) -> Dict[str, Any]:
+        """Charge the conservative estimate for an attempt that may still be billed."""
+        self.release(reservation)
+        return self.record_response(
+            model=reservation.model,
+            usage=None,
+            role="retry",
+            fallback_tokens={
+                "prompt_tokens": reservation.estimated_input_tokens,
+                "cached_tokens": 0,
+                "completion_tokens": reservation.max_output_tokens,
+            },
+            estimated_reason=reason,
+        )
 
     def record_response(
         self,
@@ -117,6 +190,7 @@ class CostTracker:
         usage: Any,
         role: str = "",
         fallback_tokens: Optional[Dict[str, int]] = None,
+        estimated_reason: str = "",
     ) -> Dict[str, Any]:
         tokens = self._extract_tokens(usage)
         usage_estimated = usage is None or not any(tokens.values())
@@ -144,6 +218,8 @@ class CostTracker:
             "remaining_usd": round(self.remaining_usd, 8),
             "guard_remaining_usd": round(self.guard_remaining_usd, 8),
         }
+        if estimated_reason:
+            record["estimated_reason"] = estimated_reason
         self._append_record(record)
         return record
 
@@ -164,13 +240,13 @@ class CostTracker:
             "safety_margin_usd": self.safety_margin_usd,
             "guard_limit_usd": round(self.guard_limit_usd, 6),
             "spent_usd": round(self.spent_usd, 6),
+            "reserved_usd": round(self.reserved_usd, 6),
             "session_spent_usd": round(self.session_spent_usd, 6),
             "remaining_usd": round(self.remaining_usd, 6),
             "guard_remaining_usd": round(self.guard_remaining_usd, 6),
             "call_count": self.call_count,
             "session_call_count": self.call_count - self.initial_call_count,
             "resumed_from_report": self.initial_call_count > 0,
-            "load_warnings": self.load_warnings,
             "by_model": self.by_model,
         }
 
@@ -214,21 +290,31 @@ class CostTracker:
         except OSError as exc:
             raise ValueError(f"Could not read existing cost report {self.report_path}: {exc}") from exc
 
-        for line in lines:
+        for line_number, line in enumerate(lines, start=1):
             if not line.strip():
                 continue
             try:
                 record = json.loads(line)
-                model = str(record["model"])
+                if not isinstance(record, dict):
+                    raise ValueError("record is not a JSON object")
+                model = record["model"]
+                if not isinstance(model, str) or not model.strip():
+                    raise ValueError("model must be a non-empty string")
                 tokens = {
-                    "prompt_tokens": max(int(record.get("prompt_tokens", 0)), 0),
-                    "cached_tokens": max(int(record.get("cached_tokens", 0)), 0),
-                    "completion_tokens": max(int(record.get("completion_tokens", 0)), 0),
+                    "prompt_tokens": int(record.get("prompt_tokens", 0)),
+                    "cached_tokens": int(record.get("cached_tokens", 0)),
+                    "completion_tokens": int(record.get("completion_tokens", 0)),
                 }
-                cost = max(float(record["cost_usd"]), 0.0)
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                self.load_warnings += 1
-                continue
+                if any(value < 0 for value in tokens.values()):
+                    raise ValueError("token counts must be non-negative")
+                cost = float(record["cost_usd"])
+                if not math.isfinite(cost) or cost < 0:
+                    raise ValueError("cost_usd must be a finite non-negative number")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Corrupt cost report {self.report_path} at line {line_number}: {exc}. "
+                    "Fix or archive the file; refusing to resume with an incomplete spend total."
+                ) from exc
             self._add_to_totals(model, tokens, cost)
 
     def _append_record(self, record: Dict[str, Any]) -> None:
