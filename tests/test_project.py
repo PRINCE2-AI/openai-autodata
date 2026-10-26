@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import httpx
+import httpx2
 from openai import APIConnectionError
 from tenacity import wait_none
 
@@ -228,7 +228,7 @@ class OpenAIAgentTests(unittest.TestCase):
                 ),
             )
             timeout = APIConnectionError(
-                request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+                request=httpx2.Request("POST", "https://api.openai.com/v1/chat/completions")
             )
             client = MagicMock()
             client.chat.completions.create.side_effect = [timeout, response]
